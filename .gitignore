@@ -1,0 +1,23 @@
+# Secrets & local environment files (NEVER commit real credentials)
+.env
+.env.*
+!.env.example
+scripts/seed_dummy_data.py
+enrichment_results.json
+
+# Python virtual environments & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+
+# Vercel local state
+.vercel/
+
+# OS / editor artifacts
+.DS_Store
+Thumbs.db
+*.log

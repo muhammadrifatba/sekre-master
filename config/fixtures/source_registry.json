@@ -1,0 +1,40 @@
+{
+  "owners": {
+    "owner_rifat": {
+      "name": "Rifat",
+      "role": "Owner / Admin",
+      "permissions": ["ingest", "enrich", "build_master", "approve_staging", "report", "send_external"],
+      "visible_categories": ["customer", "peer"]
+    },
+    "owner_andi": {
+      "name": "Andi",
+      "role": "Owner / Admin",
+      "permissions": ["ingest", "enrich", "build_master", "approve_staging", "report", "send_external"],
+      "visible_categories": ["customer", "peer"]
+    },
+    "default_owner": {
+      "name": "System Default",
+      "role": "Service Account",
+      "permissions": ["ingest", "enrich", "build_master", "report"],
+      "visible_categories": ["customer"]
+    }
+  },
+  "default_owner": "owner_rifat",
+  "rbac_rules": {
+    "TR-10_peer_privacy": {
+      "description": "Internal colleagues (category=peer) get timing_only personalization. sentiment_mix, open_complaints, and private notes are always stripped.",
+      "applies_when": "category == 'peer'",
+      "stripped_fields": ["sentiment_mix", "open_complaints", "top_intents"]
+    },
+    "TR-08_profile_poisoning": {
+      "description": "Zero silent overwrite of verified credentials. Scraped email/phone conflicts go to staging.",
+      "applies_when": "scraped_value != verified_value AND verification_status == 'verified'",
+      "action": "stage_for_approval"
+    },
+    "BR-17_pdp_blocklist": {
+      "description": "UU PDP compliance. Blocks religion, health, politics, ethnicity, and biometric attributes.",
+      "blocked_terms": ["health", "religion", "politics", "ethnicity", "sexual orientation", "union membership", "biometric", "genetic", "kesehatan", "agama", "politik", "suku", "orientasi seksual", "keanggotaan serikat", "biometrik", "genetik"],
+      "action": "dead_letter"
+    }
+  }
+}
