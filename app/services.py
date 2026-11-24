@@ -78,11 +78,11 @@ def _run_command(subcommand: str, **params: Any) -> Any:
 
 
 def _safe(subcommand: str, **params: Any) -> dict:
-    """Run a command, catching errors into a structured response."""
+    """Run a command, catching errors (including sys.exit on missing DB config) into a structured response."""
     try:
         return _run_command(subcommand, **params)
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "error", "error": str(exc), "command": subcommand}
+    except (Exception, SystemExit) as exc:  # noqa: BLE001
+        return {"status": "error", "error": str(exc) or "command exited with error", "command": subcommand}
 
 
 # ============================================================================
