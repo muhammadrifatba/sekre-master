@@ -42,6 +42,7 @@ class TestFastAPI:
             "/health", "/", "/profiler/ingest", "/profiler/pending",
             "/profiler/write", "/profiler/build-master",
             "/profiler/approve-staging", "/profiler/report", "/profiles",
+            "/profiles/{contact_id}/manual-enrich",
             "/tickets/pending", "/tickets/publish", "/tickets/approve", "/tickets",
             "/auth/login", "/auth/me", "/auth/logout",
             "/mcp/{role}",
@@ -49,11 +50,12 @@ class TestFastAPI:
         assert required <= paths
 
     def test_vercel_stateless_mcp_endpoints(self):
-        """Stateless JSON-RPC MCP on Vercel exposes 3 tools for profiler and 4 for ticket_agent."""
+        """Stateless JSON-RPC MCP on Vercel exposes 4 tools for profiler and 4 for ticket_agent."""
         res_prof = client.post("/mcp/profiler", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         assert res_prof.status_code == 200
         prof_tools = {t["name"] for t in res_prof.json()["result"]["tools"]}
-        assert len(prof_tools) == 3
+        assert len(prof_tools) == 4
+        assert "sekre_manual_enrich_profile" in prof_tools
         assert "sekre_publish_personalized_ticket" not in prof_tools
 
         res_tk = client.post("/mcp/ticket_agent", json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
@@ -133,7 +135,7 @@ class TestServices:
 class TestMCPServer:
     """WorkBuddy MCP server tool definitions (Profiler + Friend's Ticket Bridge)."""
 
-    def test_six_tools_registered(self):
+    def test_seven_tools_registered(self):
         from app import mcp_server
 
         tools = mcp_server.mcp._tool_manager.list_tools()
@@ -142,6 +144,7 @@ class TestMCPServer:
             "sekre_run_master_profiler",
             "sekre_query_master_profiles",
             "sekre_approve_master_profile_staging",
+            "sekre_manual_enrich_profile",
             "sekre_fetch_pending_tickets",
             "sekre_publish_personalized_ticket",
             "sekre_approve_ticket_to_outbox",
@@ -154,6 +157,7 @@ class TestMCPServer:
             "sekre_run_master_profiler",
             "sekre_query_master_profiles",
             "sekre_approve_master_profile_staging",
+            "sekre_manual_enrich_profile",
             "sekre_fetch_pending_tickets",
             "sekre_publish_personalized_ticket",
             "sekre_approve_ticket_to_outbox",
@@ -182,6 +186,7 @@ class TestMCPServer:
             "sekre_run_master_profiler",
             "sekre_query_master_profiles",
             "sekre_approve_master_profile_staging",
+            "sekre_manual_enrich_profile",
         }
         assert "sekre_publish_personalized_ticket" not in names
         assert "sekre_approve_ticket_to_outbox" not in names
