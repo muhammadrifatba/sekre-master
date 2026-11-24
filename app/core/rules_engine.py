@@ -295,6 +295,14 @@ def apply_peer_privacy(profile_data: dict) -> dict:
     profile_data["sentiment_mix"] = {}
     profile_data["open_complaints"] = []
     profile_data["top_intents"] = {}
+    # Strip v3 psychographic & relational intelligence (keep timing-only comms prefs)
+    profile_data["character_style"] = "unknown"
+    profile_data["churn_risk_level"] = "low"
+    profile_data["character_profile"] = {}
+    profile_data["motivation_and_pain"] = {}
+    profile_data["persuasion_profile"] = {}
+    profile_data["relationship_health"] = {}
+    profile_data["agent_brief"] = ""
 
     return profile_data
 

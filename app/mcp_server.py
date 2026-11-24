@@ -103,6 +103,8 @@ def sekre_query_master_profiles(
     tz_label: str = "",
     category: str = "",
     verification_status: str = "",
+    character_style: str = "",
+    churn_risk_level: str = "",
     needs_review_only: bool = False,
     limit: int = 50,
 ) -> dict:
@@ -116,11 +118,19 @@ def sekre_query_master_profiles(
         tz_label: 'WIB', 'WITA', or 'WIT'.
         category: 'customer' or 'peer'.
         verification_status: e.g. 'verified', 'staged_unverified'.
+        character_style: 'Driver', 'Analytical', 'Amiable', 'Expressive', or 'unknown'.
+        churn_risk_level: 'low', 'medium', or 'high'.
         needs_review_only: Only return profiles flagged for review.
         limit: Maximum results (default 50).
 
     Returns:
-        Matching master profiles with ambiguous_match flag and pending-staging count.
+        Matching master profiles. For drafting/personalization, read `agent_brief` first
+        (plain-language summary of all profile fields), and enforce hard guardrails from
+        structured fields: `tz_label`, `best_contact_window`, `communication_prefs.dnd_windows`,
+        `communication_prefs.channel_by_topic`, `relationship_health.open_promises`
+        (two-way us/customer promises with due_date), `motivation_and_pain.regulatory_focus`
+        ('prevention'=avoid downtime/risk, 'promotion'=growth/productivity), and
+        `persuasion_profile.processing_route` ('central'=data/specs, 'peripheral'=trust/brand).
     """
     return services.query_profiles(
         contact_id=contact_id,
@@ -130,8 +140,48 @@ def sekre_query_master_profiles(
         tz_label=tz_label,
         category=category,
         verification_status=verification_status,
+        character_style=character_style,
+        churn_risk_level=churn_risk_level,
         needs_review_only=needs_review_only,
         limit=limit,
+    )
+
+
+def sekre_manual_enrich_profile(
+    contact_id: str,
+    communication_prefs: dict | None = None,
+    character_profile: dict | None = None,
+    motivation_and_pain: dict | None = None,
+    persuasion_profile: dict | None = None,
+    relationship_health: dict | None = None,
+    character_style: str = "",
+    churn_risk_level: str = "",
+    owner: str = "owner_rifat",
+) -> dict:
+    """Manually enrich a customer master profile (marks updated fields user_confirmed under TR-08).
+
+    Use this to record human/sales knowledge such as proven resolution playbooks,
+    proven persuasion triggers, custom DND windows, offline key moments, or resolved promises.
+    """
+    updates: dict = {}
+    if communication_prefs is not None:
+        updates["communication_prefs"] = communication_prefs
+    if character_profile is not None:
+        updates["character_profile"] = character_profile
+    if motivation_and_pain is not None:
+        updates["motivation_and_pain"] = motivation_and_pain
+    if persuasion_profile is not None:
+        updates["persuasion_profile"] = persuasion_profile
+    if relationship_health is not None:
+        updates["relationship_health"] = relationship_health
+    if character_style:
+        updates["character_style"] = character_style
+    if churn_risk_level:
+        updates["churn_risk_level"] = churn_risk_level
+    return services.manual_enrich_profile(
+        contact_id=contact_id,
+        updates=updates,
+        owner=owner,
     )
 
 
@@ -239,6 +289,7 @@ def build_mcp_server(role: str | None = None) -> FastMCP:
     if resolved_role in ("profiler", "all"):
         server.tool()(sekre_run_master_profiler)
         server.tool()(sekre_approve_master_profile_staging)
+        server.tool()(sekre_manual_enrich_profile)
 
     # Ticket tools: ONLY Friend's WorkBuddy #2 ('ticket_agent') or admin ('all')
     if resolved_role in ("ticket_agent", "all"):

@@ -104,6 +104,16 @@ CREATE TABLE IF NOT EXISTS public.customer_master_profiles (
     open_complaints JSONB NOT NULL DEFAULT '[]'::jsonb,
     open_commitments JSONB NOT NULL DEFAULT '[]'::jsonb,
 
+    -- Deep Customer Intelligence (v3 — 5 JSONB + 2 Scalar Filters + Compiled Agent #2 Brief)
+    character_style TEXT NOT NULL DEFAULT 'unknown',           -- 'Driver' | 'Analytical' | 'Amiable' | 'Expressive' | 'unknown'
+    churn_risk_level TEXT NOT NULL DEFAULT 'low',              -- 'low' | 'medium' | 'high'
+    communication_prefs JSONB NOT NULL DEFAULT '{}'::jsonb,
+    character_profile JSONB NOT NULL DEFAULT '{}'::jsonb,
+    motivation_and_pain JSONB NOT NULL DEFAULT '{}'::jsonb,
+    persuasion_profile JSONB NOT NULL DEFAULT '{}'::jsonb,
+    relationship_health JSONB NOT NULL DEFAULT '{}'::jsonb,
+    agent_brief TEXT NOT NULL DEFAULT '',
+
     -- 5 Accountability Pillars Metadata
     consent_status TEXT NOT NULL DEFAULT 'granted',
     confidence DOUBLE PRECISION NOT NULL DEFAULT 1.0,
@@ -232,6 +242,8 @@ CREATE INDEX IF NOT EXISTS idx_customer_master_profiles_city ON public.customer_
 CREATE INDEX IF NOT EXISTS idx_customer_master_profiles_tz_label ON public.customer_master_profiles (tz_label);
 CREATE INDEX IF NOT EXISTS idx_customer_master_profiles_category ON public.customer_master_profiles (category);
 CREATE INDEX IF NOT EXISTS idx_customer_master_profiles_verification_status ON public.customer_master_profiles (verification_status);
+CREATE INDEX IF NOT EXISTS idx_customer_master_profiles_character_style ON public.customer_master_profiles (character_style);
+CREATE INDEX IF NOT EXISTS idx_customer_master_profiles_churn_risk_level ON public.customer_master_profiles (churn_risk_level);
 
 CREATE INDEX IF NOT EXISTS idx_master_profile_staging_status ON public.master_profile_staging (status);
 CREATE INDEX IF NOT EXISTS idx_master_profile_staging_master_id ON public.master_profile_staging (master_id);

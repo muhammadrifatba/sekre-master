@@ -102,6 +102,17 @@ class LoginRequest(BaseModel):
     password: str = Field(..., min_length=1)
 
 
+class ManualEnrichRequest(BaseModel):
+    communication_prefs: dict[str, Any] | None = None
+    character_profile: dict[str, Any] | None = None
+    motivation_and_pain: dict[str, Any] | None = None
+    persuasion_profile: dict[str, Any] | None = None
+    relationship_health: dict[str, Any] | None = None
+    character_style: str | None = Field(default=None, pattern="^(Driver|Analytical|Amiable|Expressive|unknown)$")
+    churn_risk_level: str | None = Field(default=None, pattern="^(low|medium|high)$")
+    owner: str = "owner_rifat"
+
+
 # ============================================================================
 # JWT Authentication Helpers
 # ============================================================================
@@ -265,6 +276,8 @@ def profiles(
     tz_label: str | None = Query(default=None, pattern="^(WIB|WITA|WIT)$"),
     category: str | None = Query(default=None, pattern="^(customer|peer)$"),
     verification_status: str = "",
+    character_style: str | None = Query(default=None, pattern="^(Driver|Analytical|Amiable|Expressive|unknown)$"),
+    churn_risk_level: str | None = Query(default=None, pattern="^(low|medium|high)$"),
     needs_review_only: bool = False,
     limit: int = Query(default=50, ge=1, le=200),
     current_owner: dict[str, Any] | None = Depends(get_optional_current_owner),
@@ -278,10 +291,40 @@ def profiles(
         tz_label=tz_label or "",
         category=category or "",
         verification_status=verification_status,
+        character_style=character_style or "",
+        churn_risk_level=churn_risk_level or "",
         needs_review_only=needs_review_only,
         viewer_owner_id=current_owner["owner_id"] if current_owner else "",
         limit=limit,
     )
+
+
+@app.patch("/profiles/{contact_id}/manual-enrich", tags=["Profiles"])
+def manual_enrich(
+    contact_id: str,
+    request: ManualEnrichRequest,
+    current_owner: dict[str, Any] | None = Depends(get_optional_current_owner),
+):
+    """Manually enrich a customer master profile (marks fields user_confirmed under TR-08 & recompiles agent_brief)."""
+    effective_owner = current_owner["owner_id"] if current_owner else request.owner
+    if current_owner:
+        perms = current_owner.get("permissions", [])
+        if "enrich" not in perms and "approve_staging" not in perms:
+            raise HTTPException(status_code=403, detail="Permission denied: missing 'enrich' permission")
+    updates = {
+        k: v
+        for k, v in request.model_dump(exclude={"owner"}).items()
+        if v is not None
+    }
+    result = services.manual_enrich_profile(
+        contact_id=contact_id,
+        updates=updates,
+        owner=effective_owner,
+    )
+    if not result.get("success"):
+        status_code = 404 if "not found" in str(result.get("error", "")).lower() else 400
+        raise HTTPException(status_code=status_code, detail=result.get("error", "Manual enrich failed"))
+    return result
 
 
 # ============================================================================

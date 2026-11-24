@@ -181,6 +181,8 @@ def get_report(tz_group: str | None = None) -> str:
 def query_profiles(contact_id: str = "", full_name: str = "", org_name: str = "",
                    city: str = "", tz_label: str = "", category: str = "",
                    verification_status: str = "",
+                   character_style: str = "",
+                   churn_risk_level: str = "",
                    needs_review_only: bool = False,
                    viewer_owner_id: str = "",
                    limit: int = 50) -> dict:
@@ -214,6 +216,12 @@ def query_profiles(contact_id: str = "", full_name: str = "", org_name: str = ""
         if verification_status:
             conditions.append("verification_status = %s")
             params.append(verification_status)
+        if character_style:
+            conditions.append("character_style = %s")
+            params.append(character_style)
+        if churn_risk_level:
+            conditions.append("churn_risk_level = %s")
+            params.append(churn_risk_level)
         if needs_review_only:
             conditions.append("needs_review = TRUE")
         if viewer_owner_id:
@@ -258,6 +266,78 @@ def query_profiles(contact_id: str = "", full_name: str = "", org_name: str = ""
             "staging_pending": staging_count,
             "profiles": profiles,
         }
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": str(exc)}
+
+
+def manual_enrich_profile(
+    contact_id: str,
+    updates: dict[str, Any],
+    owner: str = "owner_rifat",
+) -> dict:
+    """
+    Apply TR-08 manual enrichment to a customer master profile.
+    Marks updated paths as 'user_confirmed' in field_provenance, enforces BR-17 PDP
+    blocklist & TR-10 peer privacy, recompiles agent_brief, and appends audit_events.
+    """
+    from psycopg2.extras import Json, RealDictCursor
+
+    if not contact_id or not isinstance(updates, dict) or not updates:
+        return {"success": False, "error": "contact_id and non-empty updates dict are required"}
+
+    try:
+        conn = profiler.get_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM public.customer_master_profiles WHERE contact_id = %s",
+                (contact_id,),
+            )
+            existing = cur.fetchone()
+
+        if not existing:
+            conn.close()
+            return {"success": False, "error": f"Profile '{contact_id}' not found"}
+
+        updated_cols, prov, brief = profiler.apply_manual_enrichment(
+            existing=dict(existing),
+            updates=updates,
+            owner=owner,
+        )
+
+        set_clauses = []
+        params: list[Any] = []
+        for col, val in updated_cols.items():
+            set_clauses.append(f"{col} = %s")
+            params.append(Json(val) if isinstance(val, (dict, list)) else val)
+        set_clauses.append("updated_at = NOW()")
+        params.append(contact_id)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE public.customer_master_profiles SET {', '.join(set_clauses)} WHERE contact_id = %s",
+                params,
+            )
+
+        profiler.append_audit(
+            conn,
+            owner,
+            "manual_enrich_profile",
+            "customer_master_profiles",
+            contact_id,
+            {"updated_fields": list(updated_cols.keys())},
+        )
+        conn.commit()
+        conn.close()
+
+        return {
+            "success": True,
+            "contact_id": contact_id,
+            "updated_fields": list(updated_cols.keys()),
+            "agent_brief": brief,
+            "field_provenance": prov,
+        }
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": str(exc)}
 
