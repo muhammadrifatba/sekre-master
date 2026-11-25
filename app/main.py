@@ -21,7 +21,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from app import mcp_server, services  # noqa: E402
+from app import mcp_server, sekre_adapter, services  # noqa: E402
 from app.core.security import decode_access_token  # noqa: E402
 
 app = FastAPI(
@@ -111,6 +111,20 @@ class ManualEnrichRequest(BaseModel):
     character_style: str | None = Field(default=None, pattern="^(Driver|Analytical|Amiable|Expressive|unknown)$")
     churn_risk_level: str | None = Field(default=None, pattern="^(low|medium|high)$")
     owner: str = "owner_rifat"
+
+
+class SekreApproveActionRequest(BaseModel):
+    action_id: str = Field(..., min_length=1)
+    idempotency_key: str = ""
+    decision: str = Field(default="approve", pattern="^(approve|reject)$")
+    cognitive_confirmation: str = ""
+    edited_subject: str | None = None
+    edited_body_draft: str | None = None
+
+
+class SekreClarifyRequest(BaseModel):
+    contact_id: str = Field(..., min_length=1)
+    selected_slot: str = ""
 
 
 # ============================================================================
@@ -382,6 +396,111 @@ def list_tickets(
         viewer_owner_id=viewer_id,
         limit=limit,
     )
+
+
+# ============================================================================
+# Approval Gate Adapter Endpoints (sekre_* + customer_master_profiles v3, JWT)
+# ============================================================================
+
+@app.get("/api/v1/requests", tags=["ApprovalGate"])
+def api_v1_list_requests(
+    limit: int = Query(default=50, ge=1, le=200),
+    current_owner: dict[str, Any] = Depends(get_required_current_owner),
+):
+    """List sekre_results cards enriched with sekre_actions & customer_master_profiles v3."""
+    owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
+    return sekre_adapter.list_approval_requests(owner_key=owner_key, limit=limit)
+
+
+@app.get("/api/v1/requests/latest", tags=["ApprovalGate"])
+def api_v1_latest_request(
+    current_owner: dict[str, Any] = Depends(get_required_current_owner),
+):
+    """Fetch the most recent sekre_results card for the authenticated owner."""
+    owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
+    return sekre_adapter.get_latest_approval_request(owner_key=owner_key)
+
+
+@app.post("/api/v1/requests/{request_id}/approve", tags=["ApprovalGate"])
+def api_v1_approve_action(
+    request_id: str,
+    request: SekreApproveActionRequest,
+    current_owner: dict[str, Any] = Depends(get_required_current_owner),
+):
+    """Edit + approve/reject a sekre_actions row, recompute hashes, and append sekre_audit."""
+    if "send_external" not in current_owner.get("permissions", []):
+        raise HTTPException(status_code=403, detail="Permission denied: missing 'send_external' permission")
+    owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
+    result = sekre_adapter.approve_or_reject_action(
+        owner_key=owner_key,
+        request_id=request_id,
+        action_id=request.action_id,
+        idempotency_key=request.idempotency_key,
+        decision=request.decision,
+        actor_owner_id=current_owner["owner_id"],
+        cognitive_confirmation=request.cognitive_confirmation,
+        edited_subject=request.edited_subject,
+        edited_body_draft=request.edited_body_draft,
+    )
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=int(result.get("status_code") or 400),
+            detail=result.get("error", "Approval failed"),
+        )
+    return result
+
+
+@app.post("/api/v1/requests/{request_id}/clarify", tags=["ApprovalGate"])
+def api_v1_resolve_clarify(
+    request_id: str,
+    request: SekreClarifyRequest,
+    current_owner: dict[str, Any] = Depends(get_required_current_owner),
+):
+    """Resolve a needs_clarify sekre_results card with chosen contact_id & schedule slot."""
+    owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
+    result = sekre_adapter.resolve_clarify(
+        owner_key=owner_key,
+        request_id=request_id,
+        contact_id=request.contact_id,
+        selected_slot=request.selected_slot,
+        actor_owner_id=current_owner["owner_id"],
+    )
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=int(result.get("status_code") or 400),
+            detail=result.get("error", "Clarify resolution failed"),
+        )
+    return result
+
+
+@app.get("/api/v1/outbox", tags=["ApprovalGate"])
+def api_v1_outbox(
+    request_id: str = "",
+    current_owner: dict[str, Any] = Depends(get_required_current_owner),
+):
+    """List approved/queued/handed_off sekre_actions for OutboxCountdown."""
+    owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
+    return sekre_adapter.list_outbox(owner_key=owner_key, request_id=request_id)
+
+
+@app.get("/api/v1/audit/verify", tags=["ApprovalGate"])
+def api_v1_audit_verify(
+    request_id: str = "",
+    current_owner: dict[str, Any] = Depends(get_required_current_owner),
+):
+    """Verify sekre_audit hash chain and return sanitized events."""
+    owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
+    return sekre_adapter.verify_audit(owner_key=owner_key, request_id=request_id)
+
+
+@app.get("/api/v1/crm-complaints", tags=["ApprovalGate"])
+def api_v1_crm_complaints(
+    status: str = "",
+    current_owner: dict[str, Any] = Depends(get_required_current_owner),
+):
+    """List CRM complaint drafts from v_crm_complaint_draft_review."""
+    owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
+    return sekre_adapter.list_crm_complaints(owner_key=owner_key, status=status)
 
 
 # ============================================================================

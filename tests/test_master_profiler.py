@@ -1094,3 +1094,14 @@ class TestV3CustomerIntelligence:
         assert peer_prof["persuasion_profile"] == {}
         assert peer_prof["relationship_health"] == {}
         assert peer_prof["agent_brief"] == ""
+
+    def test_province_abbreviations_resolve_timezone(self):
+        """Indonesian province names and abbreviations (e.g. Kalsel, Kaltim, Papua, Kalbar) resolve accurately."""
+        assert resolve_timezone("Kalsel") == ("Asia/Makassar", "WITA")
+        assert resolve_timezone("Kalimantan Selatan") == ("Asia/Makassar", "WITA")
+        assert resolve_timezone("Kaltim") == ("Asia/Makassar", "WITA")
+        assert resolve_timezone("Sultra") == ("Asia/Makassar", "WITA")
+        assert resolve_timezone("Kalbar") == ("Asia/Jakarta", "WIB")
+        assert resolve_timezone("Kalteng") == ("Asia/Jakarta", "WIB")
+        assert resolve_timezone("Papua") == ("Asia/Jayapura", "WIT")
+        assert resolve_timezone("Halmahera") == ("Asia/Jayapura", "WIT")
