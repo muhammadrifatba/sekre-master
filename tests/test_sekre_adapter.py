@@ -113,6 +113,8 @@ class TestSekreAdapterPure:
         act = actions[0]
         assert act["channel"] == "whatsapp"
         assert act["what"]["subject"] == ""
+        assert act["what"]["body_draft"] == "Selamat pagi Pak Hendra"
+        assert act["who"]["category"] == "customer"
         assert act["who"]["phone"] == "+628000001002"
         assert act["who"]["org_name"] == "PT Borneo Karya Tambang"
         assert act["wa_handoff_link"].startswith("https://wa.me/628000001002")
@@ -178,21 +180,37 @@ class TestSekreAdapterPure:
     def test_verify_sekre_audit_chain(self):
         ev1 = {"event_id": "e1", "prev_hash": "0" * 64, "curr_hash": "h1"}
         ev2 = {"event_id": "e2", "prev_hash": "h1", "curr_hash": "h2"}
-        ok = sekre_adapter.verify_sekre_audit_chain([ev1, ev2])
+        ev3 = {"event_id": "e3", "prev_hash": "h2", "curr_hash": "h3"}
+        ok = sekre_adapter.verify_sekre_audit_chain([ev1, ev2, ev3])
         assert ok["valid"] is True
-        assert ok["total_events"] == 2
+        assert ok["total_events"] == 3
+        assert ok["head_hash"] == "h3"
+        assert ok["reason"] == ""
+        assert ok["message"]
+
+        # Same-timestamp events returned out of order should still validate cleanly
+        reordered = sekre_adapter.verify_sekre_audit_chain([ev1, ev3, ev2])
+        assert reordered["valid"] is True
 
         ev2_bad = {"event_id": "e2", "prev_hash": "WRONG", "curr_hash": "h2"}
         bad = sekre_adapter.verify_sekre_audit_chain([ev1, ev2_bad])
         assert bad["valid"] is False
         assert len(bad["breaks"]) == 1
+        assert "Chain break" in bad["reason"]
+        assert "Chain break" in bad["message"]
 
 
 class TestSekreAdapterAPIAuth:
     def test_v1_endpoints_require_jwt(self):
+        assert client.get("/api/v1/health").status_code == 200
         assert client.get("/api/v1/requests").status_code == 401
         assert client.get("/api/v1/requests/latest").status_code == 401
+        assert client.get("/api/v1/requests/req_1").status_code == 401
+        assert client.get("/api/v1/contacts").status_code == 401
         assert client.get("/api/v1/outbox").status_code == 401
+        assert client.post("/api/v1/outbox/act_1/undo").status_code == 401
+        assert client.post("/api/v1/outbox/act_1/cancel").status_code == 401
+        assert client.post("/api/v1/outbox/cancel", json={"action_id": "act_1"}).status_code == 401
         assert client.get("/api/v1/audit/verify").status_code == 401
         assert client.get("/api/v1/crm-complaints").status_code == 401
         assert client.post("/api/v1/requests/req_1/approve", json={"action_id": "a1"}).status_code == 401
@@ -216,3 +234,87 @@ class TestSekreAdapterAPIAuth:
             json={"action_id": "act_1", "decision": "approve"},
         )
         assert res.status_code == 403
+
+    def test_v1_outbox_cancel_endpoints(self):
+        token = create_access_token("owner_rifat", "Rifat")
+        with patch.object(
+            sekre_adapter,
+            "cancel_outbox_action",
+            return_value={
+                "success": True,
+                "cancelled": True,
+                "outbox_id": "obx_act_1",
+                "action_id": "act_1",
+                "request_id": "req_1",
+                "status": "undone",
+                "action_status": "awaiting_approval",
+            },
+        ) as mock_cancel:
+            res0 = client.post("/api/v1/outbox/act_1/undo", headers={"Authorization": f"Bearer {token}"})
+            assert res0.status_code == 200
+            assert res0.json()["status"] == "undone"
+
+            res1 = client.post("/api/v1/outbox/act_1/cancel", headers={"Authorization": f"Bearer {token}"})
+            assert res1.status_code == 200
+            assert res1.json()["cancelled"] is True
+
+            res2 = client.post(
+                "/api/v1/outbox/cancel",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"outbox_id": "obx_act_1"},
+            )
+            assert res2.status_code == 200
+            assert mock_cancel.call_count == 3
+
+    def test_v1_get_request_and_contacts(self):
+        token = create_access_token("owner_rifat", "Rifat")
+        with patch.object(
+            sekre_adapter,
+            "get_approval_request_by_id",
+            return_value={"request_id": "req_1", "status": "awaiting_approval"},
+        ):
+            res = client.get("/api/v1/requests/req_1", headers={"Authorization": f"Bearer {token}"})
+            assert res.status_code == 200
+            assert res.json()["request_id"] == "req_1"
+
+        with patch.object(
+            sekre_adapter,
+            "list_contacts",
+            return_value={"success": True, "count": 1, "contacts": [{"contact_id": "c_andi", "email": "andi.e2e@example.test"}]},
+        ):
+            res_c = client.get("/api/v1/contacts", headers={"Authorization": f"Bearer {token}"})
+            assert res_c.status_code == 200
+            assert res_c.json()["contacts"][0]["email"] == "andi.e2e@example.test"
+
+    def test_v1_outbox_cancel_expired_returns_409(self):
+        token = create_access_token("owner_rifat", "Rifat")
+        with patch.object(
+            sekre_adapter,
+            "cancel_outbox_action",
+            return_value={
+                "success": False,
+                "status_code": 409,
+                "error": "Waktu tunda pengaman 60 detik sudah habis; pengiriman tidak dapat dibatalkan.",
+            },
+        ):
+            res = client.post("/api/v1/outbox/act_1/cancel", headers={"Authorization": f"Bearer {token}"})
+            assert res.status_code == 409
+
+    def test_v1_approve_rejects_missing_email_400(self):
+        token = create_access_token("owner_rifat", "Rifat")
+        with patch.object(
+            sekre_adapter,
+            "approve_or_reject_action",
+            return_value={
+                "success": False,
+                "status_code": 400,
+                "error": "Alamat email penerima belum tersedia.",
+            },
+        ):
+            res = client.post(
+                "/api/v1/requests/req_1/approve",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"action_id": "act_1", "decision": "approve"},
+            )
+            assert res.status_code == 400
+            assert "email" in res.json()["detail"].lower()

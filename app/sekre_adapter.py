@@ -279,6 +279,7 @@ def build_request_card(
             "who": {
                 "contact_id": target_id,
                 "name": display_name,
+                "category": (prof.get("category") if prof else None) or "customer",
                 "org_name": org_name,
                 "city": city,
                 "tz_label": tz_label,
@@ -288,6 +289,7 @@ def build_request_card(
             "what": {
                 "subject": subject,
                 "body": body_draft,
+                "body_draft": body_draft,
             },
             "when": {
                 "scheduled_send_at": sched_dt.isoformat(),
@@ -424,8 +426,35 @@ def build_request_card(
 def verify_sekre_audit_chain(events: list[dict[str, Any]]) -> dict[str, Any]:
     """Verify prev_hash -> curr_hash continuity across chronological `sekre_audit` rows."""
     breaks: list[str] = []
+    # Re-order tied timestamps by following prev_hash -> curr_hash links so same-ms inserts
+    # don't produce false-positive chain breaks.
+    ordered = list(events)
+    if len(ordered) > 1:
+        by_prev: dict[str, list[dict[str, Any]]] = {}
+        for ev in ordered:
+            by_prev.setdefault(str(ev.get("prev_hash") or ""), []).append(ev)
+        # Walk from genesis ("0"*64) or first event if a clean chain exists
+        genesis_key = "0" * 64
+        start_prev = genesis_key if genesis_key in by_prev else str(ordered[0].get("prev_hash") or "")
+        walked: list[dict[str, Any]] = []
+        visited_ids: set[int] = set()
+        curr_prev = start_prev
+        while curr_prev in by_prev:
+            nxt = None
+            for cand in by_prev[curr_prev]:
+                if id(cand) not in visited_ids:
+                    nxt = cand
+                    break
+            if nxt is None:
+                break
+            visited_ids.add(id(nxt))
+            walked.append(nxt)
+            curr_prev = str(nxt.get("curr_hash") or "")
+        if len(walked) == len(ordered):
+            ordered = walked
+
     prev_curr: str | None = None
-    for idx, ev in enumerate(events):
+    for idx, ev in enumerate(ordered):
         p_hash = str(ev.get("prev_hash") or "")
         c_hash = str(ev.get("curr_hash") or "")
         if idx > 0 and prev_curr is not None and p_hash != prev_curr:
@@ -435,10 +464,15 @@ def verify_sekre_audit_chain(events: list[dict[str, Any]]) -> dict[str, Any]:
         if not c_hash:
             breaks.append(f"Empty curr_hash at event {ev.get('event_id', idx)}")
         prev_curr = c_hash
+    is_valid = len(breaks) == 0
+    reason_text = "" if is_valid else "; ".join(breaks)
     return {
-        "valid": len(breaks) == 0,
-        "total_events": len(events),
+        "valid": is_valid,
+        "total_events": len(ordered),
+        "head_hash": prev_curr or ("0" * 64),
         "breaks": breaks,
+        "reason": reason_text,
+        "message": "Rantai hash audit terverifikasi utuh." if is_valid else reason_text,
     }
 
 
@@ -446,8 +480,119 @@ def verify_sekre_audit_chain(events: list[dict[str, Any]]) -> dict[str, Any]:
 # Database-Backed Adapter Service Functions
 # ============================================================================
 
+def _tz_label_from_iana(tz_iana: str | None) -> str:
+    tz = str(tz_iana or "").strip()
+    if tz == "Asia/Makassar":
+        return "WITA"
+    if tz == "Asia/Jayapura":
+        return "WIT"
+    return "WIB"
+
+
+def _load_merged_profiles(cur, owner_key: str) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """
+    Load `customer_master_profiles` and merge with `sekre_profiles` + `sekre_contact_channels`
+    so contacts defined in the Sekre pilot tables (e.g. `c_andi`) resolve email, phone, and category.
+    """
+    cur.execute("SELECT * FROM public.customer_master_profiles")
+    all_profiles = [dict(r) for r in cur.fetchall()]
+    profiles_by_cid: dict[str, dict[str, Any]] = {
+        p["contact_id"]: p for p in all_profiles if p.get("contact_id")
+    }
+
+    # Merge public.sekre_profiles (guarded by SAVEPOINT so missing table never aborts tx)
+    try:
+        cur.execute("SAVEPOINT sp_sekre_profiles")
+        cur.execute(
+            """SELECT contact_id, org_id, display_name, category, personalization_level,
+                      role_title, city, timezone, tz_label, work_hours_local
+               FROM public.sekre_profiles
+               WHERE owner_key = %s""",
+            (owner_key,),
+        )
+        for sp in cur.fetchall():
+            cid = sp.get("contact_id")
+            if not cid:
+                continue
+            tz_iana = sp.get("timezone") or TZ_WIB
+            tz_lbl = sp.get("tz_label") or _tz_label_from_iana(tz_iana)
+            if cid not in profiles_by_cid:
+                merged = {
+                    "contact_id": cid,
+                    "master_id": f"sekre_{cid}",
+                    "full_name": sp.get("display_name") or cid,
+                    "category": sp.get("category") or "customer",
+                    "personalization_level": sp.get("personalization_level") or "full",
+                    "org_id": sp.get("org_id") or "",
+                    "org_name": "",
+                    "role_title": sp.get("role_title") or "",
+                    "city": sp.get("city") or "",
+                    "timezone": tz_iana,
+                    "tz_label": tz_lbl,
+                    "work_hours_local": sp.get("work_hours_local") or "08:00-17:00",
+                    "email": "",
+                    "phone_wa": "",
+                }
+                profiles_by_cid[cid] = merged
+                all_profiles.append(merged)
+            else:
+                existing = profiles_by_cid[cid]
+                if not existing.get("category") and sp.get("category"):
+                    existing["category"] = sp["category"]
+                if not existing.get("full_name") and sp.get("display_name"):
+                    existing["full_name"] = sp["display_name"]
+        cur.execute("RELEASE SAVEPOINT sp_sekre_profiles")
+    except Exception:
+        cur.execute("ROLLBACK TO SAVEPOINT sp_sekre_profiles")
+
+    # Merge public.sekre_contact_channels (email / whatsapp addresses)
+    try:
+        cur.execute("SAVEPOINT sp_sekre_channels")
+        cur.execute(
+            """SELECT contact_id, channel, address_normalized
+               FROM public.sekre_contact_channels
+               WHERE owner_key = %s""",
+            (owner_key,),
+        )
+        for ch_row in cur.fetchall():
+            cid = ch_row.get("contact_id")
+            addr = str(ch_row.get("address_normalized") or "").strip()
+            ch = normalize_channel(ch_row.get("channel"))
+            if not cid or not addr:
+                continue
+            if cid not in profiles_by_cid:
+                stub = {
+                    "contact_id": cid,
+                    "master_id": f"sekre_{cid}",
+                    "full_name": cid,
+                    "category": "customer",
+                    "personalization_level": "full",
+                    "org_id": "",
+                    "org_name": "",
+                    "role_title": "",
+                    "city": "",
+                    "timezone": TZ_WIB,
+                    "tz_label": "WIB",
+                    "work_hours_local": "08:00-17:00",
+                    "email": "",
+                    "phone_wa": "",
+                }
+                profiles_by_cid[cid] = stub
+                all_profiles.append(stub)
+            prof = profiles_by_cid[cid]
+            if ch == "email" and not prof.get("email"):
+                prof["email"] = addr
+            elif ch == "whatsapp" and not prof.get("phone_wa"):
+                prof["phone_wa"] = addr
+        cur.execute("RELEASE SAVEPOINT sp_sekre_channels")
+    except Exception:
+        cur.execute("ROLLBACK TO SAVEPOINT sp_sekre_channels")
+
+    return all_profiles, profiles_by_cid
+
+
 def list_approval_requests(owner_key: str, limit: int = 50) -> dict[str, Any]:
-    """Fetch `sekre_results` + `sekre_actions` enriched with `customer_master_profiles` v3."""
+    """Fetch `sekre_results` + `sekre_actions` enriched with `customer_master_profiles` & `sekre_profiles`."""
     from psycopg2.extras import RealDictCursor
 
     try:
@@ -480,10 +625,7 @@ def list_approval_requests(owner_key: str, limit: int = 50) -> dict[str, Any]:
                 for act in cur.fetchall():
                     actions_by_req.setdefault(act["request_id"], []).append(dict(act))
 
-            # Load master profiles + organizations for lookup & clarify candidate matching
-            cur.execute("SELECT * FROM public.customer_master_profiles")
-            all_profiles = [dict(r) for r in cur.fetchall()]
-            profiles_by_cid = {p["contact_id"]: p for p in all_profiles if p.get("contact_id")}
+            all_profiles, profiles_by_cid = _load_merged_profiles(cur, owner_key)
 
             cur.execute("SELECT org_id, organization_news FROM public.organizations")
             org_news_by_org = {
@@ -510,6 +652,85 @@ def list_approval_requests(owner_key: str, limit: int = 50) -> dict[str, Any]:
         }
     except (Exception, SystemExit) as exc:  # noqa: BLE001
         return {"success": False, "error": str(exc), "requests": []}
+
+
+def get_approval_request_by_id(owner_key: str, request_id: str) -> dict[str, Any] | None:
+    """Fetch a single enriched `sekre_results` card by request_id."""
+    from psycopg2.extras import RealDictCursor
+
+    try:
+        conn = profiler.get_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT request_id, owner_key, run_id, status, source_summary,
+                          source_refs, payload, payload_hash, created_at, updated_at
+                   FROM public.sekre_results
+                   WHERE owner_key = %s AND request_id = %s
+                   LIMIT 1""",
+                (owner_key, request_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.close()
+                return None
+
+            cur.execute(
+                """SELECT action_id, owner_key, request_id, run_id, action_type,
+                          target_type, target_id, status, idempotency_key,
+                          approval_hash, risk_tier, payload, payload_hash,
+                          created_at, updated_at
+                   FROM public.sekre_actions
+                   WHERE owner_key = %s AND request_id = %s
+                   ORDER BY created_at ASC""",
+                (owner_key, request_id),
+            )
+            actions_rows = [dict(a) for a in cur.fetchall()]
+            all_profiles, profiles_by_cid = _load_merged_profiles(cur, owner_key)
+
+            cur.execute("SELECT org_id, organization_news FROM public.organizations")
+            org_news_by_org = {
+                r["org_id"]: (r["organization_news"] or [])
+                for r in cur.fetchall()
+            }
+        conn.close()
+        return build_request_card(
+            result_row=dict(row),
+            actions_rows=actions_rows,
+            profiles_by_cid=profiles_by_cid,
+            org_news_by_org=org_news_by_org,
+            all_profiles=all_profiles,
+        )
+    except (Exception, SystemExit):  # noqa: BLE001
+        return None
+
+
+def list_contacts(owner_key: str) -> dict[str, Any]:
+    """List merged contacts from `customer_master_profiles` and `sekre_profiles`/`sekre_contact_channels`."""
+    from psycopg2.extras import RealDictCursor
+
+    try:
+        conn = profiler.get_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            all_profiles, _ = _load_merged_profiles(cur, owner_key)
+        conn.close()
+
+        contacts = [
+            {
+                "contact_id": p.get("contact_id", ""),
+                "name": p.get("full_name") or p.get("contact_id", ""),
+                "category": p.get("category") or "customer",
+                "org_name": p.get("org_name") or "",
+                "unit": p.get("role_title") or "",
+                "city": p.get("city") or "",
+                "tz_label": p.get("tz_label") or _tz_label_from_iana(p.get("timezone")),
+                "email": p.get("email") or "",
+                "phone": p.get("phone_wa") or "",
+            }
+            for p in all_profiles
+        ]
+        return {"success": True, "count": len(contacts), "contacts": contacts}
+    except (Exception, SystemExit) as exc:  # noqa: BLE001
+        return {"success": False, "error": str(exc), "contacts": []}
 
 
 def get_latest_approval_request(owner_key: str) -> dict[str, Any]:
@@ -557,6 +778,75 @@ def _append_sekre_audit(
     return event_id
 
 
+OUTBOX_UNDO_WINDOW_SECONDS = 60
+
+
+def _as_utc(dt: Any) -> datetime:
+    if isinstance(dt, datetime):
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+    if isinstance(dt, str) and dt:
+        try:
+            parsed = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+    return datetime.now(timezone.utc)
+
+
+def _resolve_recipient_contact(
+    cur,
+    target_id: str,
+    payload: dict[str, Any],
+    owner_key: str = "",
+) -> tuple[str, str]:
+    """Resolve recipient (email, phone) from payload, customer_master_profiles, or sekre_contact_channels."""
+    email = str(payload.get("recipient_email") or payload.get("email") or "").strip()
+    phone = str(payload.get("recipient_phone") or payload.get("phone") or "").strip()
+    if (not email or not phone) and target_id:
+        cur.execute(
+            """SELECT email, phone_wa
+               FROM public.customer_master_profiles
+               WHERE contact_id = %s
+               LIMIT 1""",
+            (target_id,),
+        )
+        prof = cur.fetchone()
+        if prof:
+            if not email:
+                email = str(prof.get("email") or "").strip()
+            if not phone:
+                phone = str(prof.get("phone_wa") or "").strip()
+
+    if (not email or not phone) and target_id:
+        try:
+            cur.execute("SAVEPOINT sp_resolve_sekre_ch")
+            if owner_key:
+                cur.execute(
+                    """SELECT channel, address_normalized
+                       FROM public.sekre_contact_channels
+                       WHERE owner_key = %s AND contact_id = %s""",
+                    (owner_key, target_id),
+                )
+            else:
+                cur.execute(
+                    """SELECT channel, address_normalized
+                       FROM public.sekre_contact_channels
+                       WHERE contact_id = %s""",
+                    (target_id,),
+                )
+            for row in cur.fetchall():
+                ch = normalize_channel(row.get("channel"))
+                addr = str(row.get("address_normalized") or "").strip()
+                if ch == "email" and not email and addr:
+                    email = addr
+                elif ch == "whatsapp" and not phone and addr:
+                    phone = addr
+            cur.execute("RELEASE SAVEPOINT sp_resolve_sekre_ch")
+        except Exception:
+            cur.execute("ROLLBACK TO SAVEPOINT sp_resolve_sekre_ch")
+    return email, phone
+
+
 def approve_or_reject_action(
     owner_key: str,
     request_id: str,
@@ -569,9 +859,10 @@ def approve_or_reject_action(
     edited_body_draft: str | None = None,
 ) -> dict[str, Any]:
     """
-    Atomically edit + approve/reject a `sekre_actions` row, recompute canonical
-    payload_hash & approval_hash, enforce revalidation_failed guard, sync
-    `sekre_results.status`, and append to `sekre_audit`.
+    Atomically edit + approve/reject a `sekre_actions` row, validate recipient contact info,
+    recompute canonical payload_hash & approval_hash, enforce revalidation_failed guard,
+    queue `send_email` with a 60s safety undo window, sync `sekre_results.status`,
+    and append to `sekre_audit`.
     """
     from psycopg2.extras import Json, RealDictCursor
 
@@ -616,7 +907,7 @@ def approve_or_reject_action(
 
             new_payload_hash = canonical_sha256(payload)
 
-            # Revalidation guard (§5.2 & §10): editing an already-approved action triggers revalidation_failed
+            # Revalidation guard (§5.2 & §10): editing an already-approved/queued action triggers revalidation_failed
             if act["status"] in ("approved", "queued") and new_payload_hash != old_hash:
                 cur.execute(
                     """UPDATE public.sekre_actions
@@ -644,7 +935,55 @@ def approve_or_reject_action(
                     "error": "Material changed after prior approval — marked revalidation_failed; new approval required.",
                 }
 
-            new_status = "approved" if decision == "approve" else "rejected"
+            # Idempotent retry guard: prevent duplicate approval writes/audit spam on double-click
+            if decision == "approve" and act["status"] in ("queued", "approved", "executed", "handed_off"):
+                now_utc = datetime.now(timezone.utc)
+                updated_dt = _as_utc(act.get("updated_at"))
+                send_after_dt = updated_dt + timedelta(seconds=OUTBOX_UNDO_WINDOW_SECONDS)
+                remaining = max(0, int((send_after_dt - now_utc).total_seconds())) if act["status"] == "queued" else 0
+                conn.close()
+                return {
+                    "success": True,
+                    "already_processed": True,
+                    "request_id": request_id,
+                    "action_id": action_id,
+                    "status": act["status"],
+                    "approval_hash": str(act.get("approval_hash") or ""),
+                    "payload_hash": old_hash,
+                    "send_after": send_after_dt.isoformat() if act["status"] == "queued" else None,
+                    "cancel_until": send_after_dt.isoformat() if act["status"] == "queued" else None,
+                    "remaining_seconds": remaining,
+                    "can_cancel": act["status"] == "queued" and remaining > 0,
+                }
+
+            # Recipient destination validation before allowing approval
+            act_type = str(act.get("action_type") or "")
+            if decision == "approve":
+                rec_email, rec_phone = _resolve_recipient_contact(
+                    cur, str(act.get("target_id") or ""), payload, owner_key=owner_key
+                )
+                if act_type == "send_email" and not rec_email:
+                    conn.close()
+                    return {
+                        "success": False,
+                        "status_code": 400,
+                        "error": "Alamat email penerima belum tersedia. Lengkapi alamat email tujuan sebelum menyetujui pengiriman.",
+                    }
+                if act_type == "wa_handoff" and not rec_phone:
+                    conn.close()
+                    return {
+                        "success": False,
+                        "status_code": 400,
+                        "error": "Nomor WhatsApp penerima belum tersedia. Lengkapi nomor WA tujuan sebelum menyetujui pengiriman.",
+                    }
+
+            now_utc = datetime.now(timezone.utc)
+            if decision == "approve":
+                # Email actions enter the 60-second safety undo queue (`queued`) before finalization
+                new_status = "queued" if act_type == "send_email" else "approved"
+            else:
+                new_status = "rejected"
+
             approval_hash = (
                 canonical_sha256({"action_id": action_id, "payload_hash": new_payload_hash, "owner_key": owner_key, "actor": actor_owner_id})
                 if decision == "approve"
@@ -666,7 +1005,12 @@ def approve_or_reject_action(
             )
             statuses = [r["status"] for r in cur.fetchall()]
             if statuses and "awaiting_approval" not in statuses:
-                parent_status = "approved" if any(s in ("approved", "queued", "executed", "handed_off") for s in statuses) else "rejected"
+                if "queued" in statuses:
+                    parent_status = "queued"
+                elif any(s in ("approved", "executed", "handed_off") for s in statuses):
+                    parent_status = "approved"
+                else:
+                    parent_status = "rejected"
                 cur.execute(
                     """UPDATE public.sekre_results
                        SET status = %s, updated_at = NOW()
@@ -689,6 +1033,7 @@ def approve_or_reject_action(
         conn.commit()
         conn.close()
 
+        send_after_iso = (now_utc + timedelta(seconds=OUTBOX_UNDO_WINDOW_SECONDS)).isoformat() if new_status == "queued" else None
         return {
             "success": True,
             "request_id": request_id,
@@ -697,6 +1042,10 @@ def approve_or_reject_action(
             "approval_hash": approval_hash,
             "payload_hash": new_payload_hash,
             "audit_event_id": event_id,
+            "send_after": send_after_iso,
+            "cancel_until": send_after_iso,
+            "remaining_seconds": OUTBOX_UNDO_WINDOW_SECONDS if new_status == "queued" else 0,
+            "can_cancel": new_status == "queued",
         }
     except (Exception, SystemExit) as exc:  # noqa: BLE001
         return {"success": False, "status_code": 500, "error": str(exc)}
@@ -760,7 +1109,7 @@ def resolve_clarify(
 
 
 def list_outbox(owner_key: str, request_id: str = "") -> dict[str, Any]:
-    """List approved/queued/handed_off actions from `sekre_actions` for `OutboxCountdown.tsx`."""
+    """List approved/queued/handed_off actions from `sekre_actions` with 60s countdown metadata."""
     from psycopg2.extras import RealDictCursor
 
     try:
@@ -770,6 +1119,9 @@ def list_outbox(owner_key: str, request_id: str = "") -> dict[str, Any]:
         if request_id:
             conditions.append("request_id = %s")
             params.append(request_id)
+
+        now_utc = datetime.now(timezone.utc)
+        expired_action_ids: list[tuple[str, str]] = []
 
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -781,26 +1133,176 @@ def list_outbox(owner_key: str, request_id: str = "") -> dict[str, Any]:
                 params,
             )
             rows = cur.fetchall()
-        conn.close()
 
-        items = []
-        for r in rows:
-            ap = r.get("payload") or {}
-            items.append({
-                "outbox_id": f"obx_{r['action_id']}",
-                "action_id": r["action_id"],
-                "request_id": r["request_id"],
-                "channel": normalize_channel(ap.get("channel") or ("whatsapp" if r["action_type"] == "wa_handoff" else "email")),
-                "recipient_name": ap.get("recipient_name") or r["target_id"],
-                "subject": ap.get("subject") or "",
-                "body": ap.get("body_draft") or "",
-                "status": r["status"],
-                "approval_hash": r["approval_hash"],
-                "updated_at": r["updated_at"].isoformat() if hasattr(r["updated_at"], "isoformat") else str(r["updated_at"]),
-            })
+            items = []
+            for r in rows:
+                ap = r.get("payload") or {}
+                updated_dt = _as_utc(r.get("updated_at"))
+                send_after_dt = updated_dt + timedelta(seconds=OUTBOX_UNDO_WINDOW_SECONDS)
+                db_status = str(r["status"])
+                remaining = 0
+                if db_status == "queued":
+                    remaining = max(0, int((send_after_dt - now_utc).total_seconds()))
+                    if remaining == 0:
+                        db_status = "approved"
+                        expired_action_ids.append((r["action_id"], r["request_id"]))
+
+                # Map DB status to OutboxCountdown.tsx contract ('queued_outbox' | 'sent')
+                ui_status = "queued_outbox" if (db_status == "queued" and remaining > 0) else "sent"
+                rec_email, rec_phone = _resolve_recipient_contact(
+                    cur, str(r.get("target_id") or ""), ap, owner_key=owner_key
+                )
+                channel = normalize_channel(ap.get("channel") or ("whatsapp" if r["action_type"] == "wa_handoff" else "email"))
+                recipient_address = (
+                    (rec_phone if channel == "whatsapp" else rec_email)
+                    or rec_email
+                    or rec_phone
+                    or ap.get("recipient_name")
+                    or r["target_id"]
+                )
+                items.append({
+                    "outbox_id": f"obx_{r['action_id']}",
+                    "action_id": r["action_id"],
+                    "request_id": r["request_id"],
+                    "channel": channel,
+                    "recipient_name": ap.get("recipient_name") or r["target_id"],
+                    "recipient_address": recipient_address,
+                    "recipient_email": rec_email,
+                    "subject": ap.get("subject") or "",
+                    "body": ap.get("body_draft") or "",
+                    "status": ui_status,
+                    "db_status": db_status,
+                    "approval_hash": r["approval_hash"],
+                    "enqueued_at": updated_dt.isoformat(),
+                    "queued_at": updated_dt.isoformat(),
+                    "release_at": send_after_dt.isoformat(),
+                    "send_after": send_after_dt.isoformat(),
+                    "scheduled_send_at": send_after_dt.isoformat(),
+                    "cancel_until": send_after_dt.isoformat(),
+                    "remaining_seconds": remaining,
+                    "countdown_seconds": remaining,
+                    "can_cancel": ui_status == "queued_outbox",
+                    "updated_at": updated_dt.isoformat(),
+                })
+
+            if expired_action_ids:
+                for act_id, req_id in expired_action_ids:
+                    cur.execute(
+                        """UPDATE public.sekre_actions
+                           SET status = 'approved'
+                           WHERE owner_key = %s AND action_id = %s AND status = 'queued'""",
+                        (owner_key, act_id),
+                    )
+                    cur.execute(
+                        """UPDATE public.sekre_results
+                           SET status = 'approved'
+                           WHERE owner_key = %s AND request_id = %s AND status = 'queued'""",
+                        (owner_key, req_id),
+                    )
+                conn.commit()
+        conn.close()
         return {"success": True, "count": len(items), "items": items}
     except (Exception, SystemExit) as exc:  # noqa: BLE001
         return {"success": False, "error": str(exc), "items": []}
+
+
+def cancel_outbox_action(
+    owner_key: str,
+    action_id: str,
+    actor_owner_id: str,
+) -> dict[str, Any]:
+    """Cancel a queued action during its 60-second safety window and revert to awaiting_approval."""
+    from psycopg2.extras import RealDictCursor
+
+    clean_action_id = str(action_id or "").strip()
+    if clean_action_id.startswith("obx_"):
+        clean_action_id = clean_action_id[4:]
+    if not clean_action_id:
+        return {"success": False, "status_code": 400, "error": "action_id is required"}
+
+    try:
+        conn = profiler.get_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT * FROM public.sekre_actions
+                   WHERE owner_key = %s AND action_id = %s
+                   FOR UPDATE""",
+                (owner_key, clean_action_id),
+            )
+            act = cur.fetchone()
+            if not act:
+                conn.close()
+                return {"success": False, "status_code": 404, "error": f"Outbox action '{clean_action_id}' not found"}
+
+            if act["status"] != "queued":
+                conn.close()
+                return {
+                    "success": False,
+                    "status_code": 409,
+                    "error": f"Pengiriman tidak dapat dibatalkan karena status saat ini '{act['status']}'.",
+                }
+
+            now_utc = datetime.now(timezone.utc)
+            updated_dt = _as_utc(act.get("updated_at"))
+            if (now_utc - updated_dt).total_seconds() >= OUTBOX_UNDO_WINDOW_SECONDS:
+                cur.execute(
+                    """UPDATE public.sekre_actions
+                       SET status = 'approved'
+                       WHERE owner_key = %s AND action_id = %s AND status = 'queued'""",
+                    (owner_key, clean_action_id),
+                )
+                cur.execute(
+                    """UPDATE public.sekre_results
+                       SET status = 'approved'
+                       WHERE owner_key = %s AND request_id = %s AND status = 'queued'""",
+                    (owner_key, act["request_id"]),
+                )
+                conn.commit()
+                conn.close()
+                return {
+                    "success": False,
+                    "status_code": 409,
+                    "error": "Waktu tunda pengaman 60 detik sudah habis; pengiriman tidak dapat dibatalkan.",
+                }
+
+            cur.execute(
+                """UPDATE public.sekre_actions
+                   SET status = 'awaiting_approval', approval_hash = '', updated_at = NOW()
+                   WHERE owner_key = %s AND action_id = %s""",
+                (owner_key, clean_action_id),
+            )
+            cur.execute(
+                """UPDATE public.sekre_results
+                   SET status = 'awaiting_approval', updated_at = NOW()
+                   WHERE owner_key = %s AND request_id = %s""",
+                (owner_key, act["request_id"]),
+            )
+            event_id = _append_sekre_audit(
+                cur,
+                owner_key,
+                act["request_id"],
+                str(act.get("run_id") or ""),
+                "action_cancelled",
+                {
+                    "action_id": clean_action_id,
+                    "actor": actor_owner_id,
+                    "previous_status": "queued",
+                },
+            )
+        conn.commit()
+        conn.close()
+        return {
+            "success": True,
+            "cancelled": True,
+            "outbox_id": f"obx_{clean_action_id}",
+            "action_id": clean_action_id,
+            "request_id": act["request_id"],
+            "status": "undone",
+            "action_status": "awaiting_approval",
+            "audit_event_id": event_id,
+        }
+    except (Exception, SystemExit) as exc:  # noqa: BLE001
+        return {"success": False, "status_code": 500, "error": str(exc)}
 
 
 def verify_audit(owner_key: str, request_id: str = "") -> dict[str, Any]:
@@ -825,6 +1327,7 @@ def verify_audit(owner_key: str, request_id: str = "") -> dict[str, Any]:
         filtered = [e for e in all_events if not request_id or e.get("request_id") == request_id]
         serialized = [
             {
+                "id": e["event_id"],
                 "event_id": e["event_id"],
                 "request_id": e.get("request_id", ""),
                 "run_id": e.get("run_id", ""),
@@ -838,7 +1341,12 @@ def verify_audit(owner_key: str, request_id: str = "") -> dict[str, Any]:
         ]
         return {"success": True, "verification": verification, "events": serialized}
     except (Exception, SystemExit) as exc:  # noqa: BLE001
-        return {"success": False, "error": str(exc), "verification": {"valid": False, "breaks": [str(exc)]}, "events": []}
+        return {
+            "success": False,
+            "error": str(exc),
+            "verification": {"valid": False, "total_events": 0, "breaks": [str(exc)], "reason": str(exc), "message": str(exc)},
+            "events": [],
+        }
 
 
 def list_crm_complaints(owner_key: str, status: str = "") -> dict[str, Any]:

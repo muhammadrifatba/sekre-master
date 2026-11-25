@@ -127,6 +127,11 @@ class SekreClarifyRequest(BaseModel):
     selected_slot: str = ""
 
 
+class SekreCancelOutboxRequest(BaseModel):
+    action_id: str = ""
+    outbox_id: str = ""
+
+
 # ============================================================================
 # JWT Authentication Helpers
 # ============================================================================
@@ -402,6 +407,12 @@ def list_tickets(
 # Approval Gate Adapter Endpoints (sekre_* + customer_master_profiles v3, JWT)
 # ============================================================================
 
+@app.get("/api/v1/health", tags=["ApprovalGate"])
+def api_v1_health():
+    """Hackathon v1 health alias."""
+    return {"status": "ok", **services.check_health()}
+
+
 @app.get("/api/v1/requests", tags=["ApprovalGate"])
 def api_v1_list_requests(
     limit: int = Query(default=50, ge=1, le=200),
@@ -419,6 +430,19 @@ def api_v1_latest_request(
     """Fetch the most recent sekre_results card for the authenticated owner."""
     owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
     return sekre_adapter.get_latest_approval_request(owner_key=owner_key)
+
+
+@app.get("/api/v1/requests/{request_id}", tags=["ApprovalGate"])
+def api_v1_get_request(
+    request_id: str,
+    current_owner: dict[str, Any] = Depends(get_required_current_owner),
+):
+    """Fetch a single sekre_results card by request_id."""
+    owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
+    card = sekre_adapter.get_approval_request_by_id(owner_key=owner_key, request_id=request_id)
+    if not card:
+        raise HTTPException(status_code=404, detail=f"Request '{request_id}' not found")
+    return card
 
 
 @app.post("/api/v1/requests/{request_id}/approve", tags=["ApprovalGate"])
@@ -478,9 +502,60 @@ def api_v1_outbox(
     request_id: str = "",
     current_owner: dict[str, Any] = Depends(get_required_current_owner),
 ):
-    """List approved/queued/handed_off sekre_actions for OutboxCountdown."""
+    """List approved/queued/handed_off sekre_actions with 60s countdown metadata for OutboxCountdown."""
     owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
     return sekre_adapter.list_outbox(owner_key=owner_key, request_id=request_id)
+
+
+@app.post("/api/v1/outbox/{action_id}/undo", tags=["ApprovalGate"])
+@app.post("/api/v1/outbox/{action_id}/cancel", tags=["ApprovalGate"])
+def api_v1_outbox_cancel(
+    action_id: str,
+    current_owner: dict[str, Any] = Depends(get_required_current_owner),
+):
+    """Undo/cancel a queued outbox action during the 60-second safety undo window."""
+    owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
+    result = sekre_adapter.cancel_outbox_action(
+        owner_key=owner_key,
+        action_id=action_id,
+        actor_owner_id=current_owner["owner_id"],
+    )
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=int(result.get("status_code") or 400),
+            detail=result.get("error", "Cancel failed"),
+        )
+    return result
+
+
+@app.post("/api/v1/outbox/cancel", tags=["ApprovalGate"])
+def api_v1_outbox_cancel_body(
+    request: SekreCancelOutboxRequest,
+    current_owner: dict[str, Any] = Depends(get_required_current_owner),
+):
+    """Cancel a queued outbox action via JSON body (`action_id` or `outbox_id`)."""
+    owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
+    target_id = request.action_id or request.outbox_id
+    result = sekre_adapter.cancel_outbox_action(
+        owner_key=owner_key,
+        action_id=target_id,
+        actor_owner_id=current_owner["owner_id"],
+    )
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=int(result.get("status_code") or 400),
+            detail=result.get("error", "Cancel failed"),
+        )
+    return result
+
+
+@app.get("/api/v1/contacts", tags=["ApprovalGate"])
+def api_v1_contacts(
+    current_owner: dict[str, Any] = Depends(get_required_current_owner),
+):
+    """List merged contacts (customer_master_profiles + sekre_profiles/sekre_contact_channels)."""
+    owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
+    return sekre_adapter.list_contacts(owner_key=owner_key)
 
 
 @app.get("/api/v1/audit/verify", tags=["ApprovalGate"])
