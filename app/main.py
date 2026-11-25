@@ -30,14 +30,20 @@ app = FastAPI(
     version="2.0.0",
 )
 
-# Allow localhost:3000, custom CORS_ORIGINS env var, and any *.vercel.app deployment
+# Allow localhost:3000, production sekre-v3.web.id, custom CORS_ORIGINS env var, and any *.vercel.app deployment
 _extra_origins = [
-    o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()
+    o.strip().rstrip("/") for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()
 ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", *_extra_origins],
-    allow_origin_regex=r"https://.*\.vercel\.app|http://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://sekre-v3.web.id",
+        "https://www.sekre-v3.web.id",
+        *_extra_origins,
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app|https://(www\.)?sekre-v3\.web\.id|http://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

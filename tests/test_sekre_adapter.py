@@ -235,6 +235,19 @@ class TestSekreAdapterAPIAuth:
         )
         assert res.status_code == 403
 
+    def test_cors_preflight_allows_sekre_web_id(self):
+        for origin in ("https://sekre-v3.web.id", "https://www.sekre-v3.web.id"):
+            res = client.options(
+                "/auth/login",
+                headers={
+                    "Origin": origin,
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "content-type,authorization",
+                },
+            )
+            assert res.status_code == 200
+            assert res.headers.get("access-control-allow-origin") == origin
+
     def test_v1_outbox_cancel_endpoints(self):
         token = create_access_token("owner_rifat", "Rifat")
         with patch.object(
