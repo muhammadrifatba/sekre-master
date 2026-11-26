@@ -1382,3 +1382,125 @@ def list_crm_complaints(owner_key: str, status: str = "") -> dict[str, Any]:
         return {"success": True, "count": len(items), "items": items}
     except (Exception, SystemExit) as exc:  # noqa: BLE001
         return {"success": False, "error": str(exc), "items": []}
+
+
+def list_order_followups(owner_key: str, run_id: str = "") -> dict[str, Any]:
+    """
+    Fetch order follow-up items extracted from `sekre_results.payload->'order_drafts'`
+    for the latest `run_id` (or a specific `run_id` if provided).
+    """
+    from psycopg2.extras import RealDictCursor
+
+    try:
+        conn = profiler.get_connection()
+        if run_id:
+            sql = """
+                WITH rows_with_drafts AS (
+                  SELECT r.request_id, r.run_id, r.payload->'order_drafts' AS order_drafts
+                  FROM public.sekre_results r
+                  WHERE r.owner_key = %s
+                    AND r.run_id = %s
+                    AND jsonb_typeof(r.payload->'order_drafts') = 'array'
+                    AND COALESCE(jsonb_array_length(r.payload->'order_drafts'), 0) > 0
+                ),
+                one_draft AS (
+                  SELECT DISTINCT ON (d.value->>'order_draft_id')
+                         r.request_id,
+                         r.run_id,
+                         d.value->>'order_draft_id' AS order_draft_id,
+                         d.value AS draft
+                  FROM rows_with_drafts r
+                  CROSS JOIN LATERAL jsonb_array_elements(r.order_drafts) d(value)
+                  ORDER BY d.value->>'order_draft_id', r.request_id
+                )
+                SELECT o.request_id,
+                       o.run_id,
+                       o.order_draft_id,
+                       o.draft->>'full_name'       AS nama_pemesan,
+                       o.draft->>'org_name'        AS nama_customer,
+                       o.draft->>'po_reference'    AS po_reference,
+                       o.draft->>'due_date'        AS due_date,
+                       so.value->>'so_id'          AS so_id,
+                       so.value->>'status'         AS so_status,
+                       so.value->>'billing_status' AS billing_status,
+                       jsonb_agg(jsonb_build_object(
+                         'item', li.value->>'item_name',
+                         'qty',  li.value->>'quantity',
+                         'unit', li.value->>'unit'
+                       ) ORDER BY li.value->>'item_name') AS items
+                FROM one_draft o
+                CROSS JOIN LATERAL jsonb_array_elements(COALESCE(o.draft->'sales_orders', '[]'::jsonb)) so(value)
+                CROSS JOIN LATERAL jsonb_array_elements(COALESCE(so.value->'line_items', '[]'::jsonb)) li(value)
+                GROUP BY o.request_id, o.run_id, o.order_draft_id, o.draft, nama_pemesan, nama_customer,
+                         po_reference, due_date, so_id, so_status, billing_status
+                ORDER BY o.order_draft_id, so_id
+            """
+            params: tuple[Any, ...] = (owner_key, run_id)
+        else:
+            sql = """
+                WITH latest AS (
+                  SELECT run_id
+                  FROM public.sekre_results
+                  WHERE owner_key = %s
+                  GROUP BY run_id
+                  ORDER BY MAX(created_at) DESC
+                  LIMIT 1
+                ),
+                rows_with_drafts AS (
+                  SELECT r.request_id, r.run_id, r.payload->'order_drafts' AS order_drafts
+                  FROM public.sekre_results r
+                  JOIN latest l ON l.run_id = r.run_id
+                  WHERE r.owner_key = %s
+                    AND jsonb_typeof(r.payload->'order_drafts') = 'array'
+                    AND COALESCE(jsonb_array_length(r.payload->'order_drafts'), 0) > 0
+                ),
+                one_draft AS (
+                  SELECT DISTINCT ON (d.value->>'order_draft_id')
+                         r.request_id,
+                         r.run_id,
+                         d.value->>'order_draft_id' AS order_draft_id,
+                         d.value AS draft
+                  FROM rows_with_drafts r
+                  CROSS JOIN LATERAL jsonb_array_elements(r.order_drafts) d(value)
+                  ORDER BY d.value->>'order_draft_id', r.request_id
+                )
+                SELECT o.request_id,
+                       o.run_id,
+                       o.order_draft_id,
+                       o.draft->>'full_name'       AS nama_pemesan,
+                       o.draft->>'org_name'        AS nama_customer,
+                       o.draft->>'po_reference'    AS po_reference,
+                       o.draft->>'due_date'        AS due_date,
+                       so.value->>'so_id'          AS so_id,
+                       so.value->>'status'         AS so_status,
+                       so.value->>'billing_status' AS billing_status,
+                       jsonb_agg(jsonb_build_object(
+                         'item', li.value->>'item_name',
+                         'qty',  li.value->>'quantity',
+                         'unit', li.value->>'unit'
+                       ) ORDER BY li.value->>'item_name') AS items
+                FROM one_draft o
+                CROSS JOIN LATERAL jsonb_array_elements(COALESCE(o.draft->'sales_orders', '[]'::jsonb)) so(value)
+                CROSS JOIN LATERAL jsonb_array_elements(COALESCE(so.value->'line_items', '[]'::jsonb)) li(value)
+                GROUP BY o.request_id, o.run_id, o.order_draft_id, o.draft, nama_pemesan, nama_customer,
+                         po_reference, due_date, so_id, so_status, billing_status
+                ORDER BY o.order_draft_id, so_id
+            """
+            params = (owner_key, owner_key)
+
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        conn.close()
+
+        items = [dict(r) for r in rows]
+        resolved_run_id = items[0].get("run_id") if items else (run_id or None)
+        return {
+            "success": True,
+            "owner_key": owner_key,
+            "run_id": resolved_run_id,
+            "count": len(items),
+            "items": items,
+        }
+    except (Exception, SystemExit) as exc:  # noqa: BLE001
+        return {"success": False, "error": str(exc), "count": 0, "items": []}

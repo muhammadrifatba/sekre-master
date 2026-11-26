@@ -213,6 +213,7 @@ class TestSekreAdapterAPIAuth:
         assert client.post("/api/v1/outbox/cancel", json={"action_id": "act_1"}).status_code == 401
         assert client.get("/api/v1/audit/verify").status_code == 401
         assert client.get("/api/v1/crm-complaints").status_code == 401
+        assert client.get("/api/v1/order-followups").status_code == 401
         assert client.post("/api/v1/requests/req_1/approve", json={"action_id": "a1"}).status_code == 401
 
     def test_v1_requests_with_valid_jwt(self):
@@ -247,6 +248,34 @@ class TestSekreAdapterAPIAuth:
             )
             assert res.status_code == 200
             assert res.headers.get("access-control-allow-origin") == origin
+
+    def test_v1_order_followups_with_valid_jwt(self):
+        token = create_access_token("owner_rifat", "Rifat")
+        sample = {
+            "success": True,
+            "owner_key": "owner_demo",
+            "run_id": "run-123",
+            "count": 1,
+            "items": [
+                {
+                    "order_draft_id": "ord-001",
+                    "nama_pemesan": "Hendra Pratama",
+                    "nama_customer": "PT Borneo Karya Tambang",
+                    "po_reference": "PO-2026-001",
+                    "due_date": "2026-12-01",
+                    "so_id": "SO-1001",
+                    "so_status": "open",
+                    "billing_status": "unbilled",
+                    "items": [{"item": "PC200-8M0", "qty": 4, "unit": "unit"}],
+                }
+            ],
+        }
+        with patch.object(sekre_adapter, "list_order_followups", return_value=sample):
+            res = client.get("/api/v1/order-followups", headers={"Authorization": f"Bearer {token}"})
+            assert res.status_code == 200
+            data = res.json()
+            assert data["count"] == 1
+            assert data["items"][0]["so_id"] == "SO-1001"
 
     def test_v1_outbox_cancel_endpoints(self):
         token = create_access_token("owner_rifat", "Rifat")

@@ -584,6 +584,16 @@ def api_v1_crm_complaints(
     return sekre_adapter.list_crm_complaints(owner_key=owner_key, status=status)
 
 
+@app.get("/api/v1/order-followups", tags=["ApprovalGate"])
+def api_v1_order_followups(
+    run_id: str = "",
+    current_owner: dict[str, Any] = Depends(get_required_current_owner),
+):
+    """List order follow-up items extracted from sekre_results.payload->'order_drafts' (latest run by default)."""
+    owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
+    return sekre_adapter.list_order_followups(owner_key=owner_key, run_id=run_id)
+
+
 # ============================================================================
 # Serverless-Ready Remote MCP Endpoints (Stateless JSON-RPC 2.0 for Vercel)
 # ============================================================================
