@@ -133,6 +133,22 @@ class SekreClarifyRequest(BaseModel):
     selected_slot: str = ""
 
 
+class SekreApproveOrderRequest(BaseModel):
+    order_draft_id: str = Field(..., min_length=1)
+    decision: str = Field(default="approve", pattern="^(approve|reject)$")
+    request_id: str = ""
+    run_id: str = ""
+    so_id: str = ""
+    nama_pemesan: str = ""
+    nama_customer: str = ""
+    po_reference: str = ""
+    due_date: str = ""
+    so_status: str = "processing"
+    billing_status: str = "pending_invoice"
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    notes: str = ""
+
+
 class SekreCancelOutboxRequest(BaseModel):
     action_id: str = ""
     outbox_id: str = ""
@@ -592,6 +608,51 @@ def api_v1_order_followups(
     """List order follow-up items extracted from sekre_results.payload->'order_drafts' (latest run by default)."""
     owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
     return sekre_adapter.list_order_followups(owner_key=owner_key, run_id=run_id)
+
+
+@app.post("/api/v1/order-followups/approve", tags=["ApprovalGate"])
+def api_v1_approve_order_followup(
+    request: SekreApproveOrderRequest,
+    current_owner: dict[str, Any] = Depends(get_required_current_owner),
+):
+    """Edit & approve/reject an order follow-up into public.sekre_approved_orders + append sekre_audit."""
+    perms = current_owner.get("permissions", [])
+    if "send_external" not in perms and "approve_staging" not in perms:
+        raise HTTPException(status_code=403, detail="Permission denied: missing approval permission")
+    owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
+    result = sekre_adapter.approve_order_followup(
+        owner_key=owner_key,
+        order_draft_id=request.order_draft_id,
+        actor_owner_id=current_owner["owner_id"],
+        decision=request.decision,
+        request_id=request.request_id,
+        run_id=request.run_id,
+        so_id=request.so_id,
+        nama_pemesan=request.nama_pemesan,
+        nama_customer=request.nama_customer,
+        po_reference=request.po_reference,
+        due_date=request.due_date,
+        so_status=request.so_status,
+        billing_status=request.billing_status,
+        items=request.items,
+        notes=request.notes,
+    )
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=int(result.get("status_code") or 400),
+            detail=result.get("error", "Order approval failed"),
+        )
+    return result
+
+
+@app.get("/api/v1/approved-orders", tags=["ApprovalGate"])
+def api_v1_list_approved_orders(
+    limit: int = Query(default=50, ge=1, le=200),
+    current_owner: dict[str, Any] = Depends(get_required_current_owner),
+):
+    """List all approved/processed orders from public.sekre_approved_orders."""
+    owner_key = sekre_adapter.resolve_sekre_owner_key(current_owner)
+    return sekre_adapter.list_approved_orders(owner_key=owner_key, limit=limit)
 
 
 # ============================================================================

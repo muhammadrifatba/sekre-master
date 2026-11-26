@@ -1491,9 +1491,58 @@ def list_order_followups(owner_key: str, run_id: str = "") -> dict[str, Any]:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
+
+            # Merge any approved/rejected order overrides from public.sekre_approved_orders
+            approved_map: dict[tuple[str, str], dict[str, Any]] = {}
+            try:
+                cur.execute("SAVEPOINT sp_approved_orders")
+                cur.execute(
+                    """SELECT approved_order_id, order_draft_id, so_id, nama_pemesan, nama_customer,
+                              po_reference, due_date, so_status, billing_status, items_json,
+                              notes, decision, approval_hash, approved_by, approved_at
+                       FROM public.sekre_approved_orders
+                       WHERE owner_key = %s""",
+                    (owner_key,),
+                )
+                for ar in cur.fetchall():
+                    approved_map[(str(ar["order_draft_id"]), str(ar["so_id"] or ""))] = dict(ar)
+                cur.execute("RELEASE SAVEPOINT sp_approved_orders")
+            except Exception:
+                cur.execute("ROLLBACK TO SAVEPOINT sp_approved_orders")
         conn.close()
 
-        items = [dict(r) for r in rows]
+        items = []
+        for r in rows:
+            d = dict(r)
+            key = (str(d.get("order_draft_id") or ""), str(d.get("so_id") or ""))
+            apr = approved_map.get(key)
+            if apr:
+                d["nama_pemesan"] = apr["nama_pemesan"]
+                d["nama_customer"] = apr["nama_customer"]
+                d["po_reference"] = apr["po_reference"]
+                d["due_date"] = apr["due_date"]
+                d["so_status"] = apr["so_status"]
+                d["billing_status"] = apr["billing_status"]
+                d["items"] = apr["items_json"] or d.get("items") or []
+                d["notes"] = apr["notes"] or ""
+                d["approval_status"] = apr["decision"]
+                d["approved_order_id"] = apr["approved_order_id"]
+                d["approved_by"] = apr["approved_by"]
+                d["approval_hash"] = apr["approval_hash"]
+                d["approved_at"] = (
+                    apr["approved_at"].isoformat()
+                    if hasattr(apr["approved_at"], "isoformat")
+                    else str(apr["approved_at"] or "")
+                )
+            else:
+                d["notes"] = ""
+                d["approval_status"] = "pending"
+                d["approved_order_id"] = None
+                d["approved_by"] = None
+                d["approval_hash"] = ""
+                d["approved_at"] = None
+            items.append(d)
+
         resolved_run_id = items[0].get("run_id") if items else (run_id or None)
         return {
             "success": True,
@@ -1502,5 +1551,153 @@ def list_order_followups(owner_key: str, run_id: str = "") -> dict[str, Any]:
             "count": len(items),
             "items": items,
         }
+    except (Exception, SystemExit) as exc:  # noqa: BLE001
+        return {"success": False, "error": str(exc), "count": 0, "items": []}
+
+
+def approve_order_followup(
+    owner_key: str,
+    order_draft_id: str,
+    actor_owner_id: str,
+    decision: str = "approve",
+    request_id: str = "",
+    run_id: str = "",
+    so_id: str = "",
+    nama_pemesan: str = "",
+    nama_customer: str = "",
+    po_reference: str = "",
+    due_date: str = "",
+    so_status: str = "processing",
+    billing_status: str = "pending_invoice",
+    items: list[dict[str, Any]] | None = None,
+    notes: str = "",
+) -> dict[str, Any]:
+    """
+    Save an edited & approved (or rejected) order follow-up into `public.sekre_approved_orders`
+    and append a hash-chained event to `public.sekre_audit`.
+    """
+    from psycopg2.extras import Json, RealDictCursor
+
+    if not order_draft_id:
+        return {"success": False, "status_code": 400, "error": "order_draft_id is required"}
+    if decision not in ("approve", "reject"):
+        return {"success": False, "status_code": 400, "error": "decision must be 'approve' or 'reject'"}
+
+    clean_items = []
+    for li in (items or []):
+        if isinstance(li, dict) and str(li.get("item") or "").strip():
+            clean_items.append({
+                "item": str(li.get("item") or "").strip(),
+                "qty": li.get("qty"),
+                "unit": str(li.get("unit") or "").strip(),
+            })
+    if decision == "approve" and not clean_items:
+        return {"success": False, "status_code": 400, "error": "Minimal 1 item order wajib diisi untuk menyetujui orderan"}
+
+    norm_decision = "approved" if decision == "approve" else "rejected"
+    effective_so_status = "rejected" if norm_decision == "rejected" else (so_status or "processing")
+    approval_payload = {
+        "owner_key": owner_key,
+        "order_draft_id": order_draft_id,
+        "so_id": so_id,
+        "nama_pemesan": nama_pemesan,
+        "nama_customer": nama_customer,
+        "po_reference": po_reference,
+        "due_date": due_date,
+        "so_status": effective_so_status,
+        "billing_status": billing_status,
+        "items": clean_items,
+        "notes": notes,
+        "decision": norm_decision,
+        "actor": actor_owner_id,
+    }
+    approval_hash = canonical_sha256(approval_payload)
+    approved_order_id = f"ord_apr_{canonical_sha256(f'{owner_key}:{order_draft_id}:{so_id}')[:12]}"
+
+    try:
+        conn = profiler.get_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """INSERT INTO public.sekre_approved_orders
+                   (approved_order_id, owner_key, request_id, run_id, order_draft_id, so_id,
+                    nama_pemesan, nama_customer, po_reference, due_date, so_status, billing_status,
+                    items_json, notes, decision, approval_hash, approved_by, approved_at, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                   ON CONFLICT (owner_key, order_draft_id, so_id) DO UPDATE SET
+                     request_id     = EXCLUDED.request_id,
+                     run_id         = EXCLUDED.run_id,
+                     nama_pemesan   = EXCLUDED.nama_pemesan,
+                     nama_customer  = EXCLUDED.nama_customer,
+                     po_reference   = EXCLUDED.po_reference,
+                     due_date       = EXCLUDED.due_date,
+                     so_status      = EXCLUDED.so_status,
+                     billing_status = EXCLUDED.billing_status,
+                     items_json     = EXCLUDED.items_json,
+                     notes          = EXCLUDED.notes,
+                     decision       = EXCLUDED.decision,
+                     approval_hash  = EXCLUDED.approval_hash,
+                     approved_by    = EXCLUDED.approved_by,
+                     approved_at    = NOW(),
+                     updated_at     = NOW()
+                   RETURNING *""",
+                (
+                    approved_order_id, owner_key, request_id, run_id, order_draft_id, so_id,
+                    nama_pemesan, nama_customer, po_reference, due_date, effective_so_status,
+                    billing_status, Json(clean_items), notes, norm_decision, approval_hash,
+                    actor_owner_id,
+                ),
+            )
+            saved = dict(cur.fetchone())
+
+            event_id = _append_sekre_audit(
+                cur,
+                owner_key=owner_key,
+                request_id=request_id or order_draft_id,
+                run_id=run_id,
+                event_type=f"order_followup_{norm_decision}",
+                payload_json={
+                    "approved_order_id": saved["approved_order_id"],
+                    "order_draft_id": order_draft_id,
+                    "so_id": so_id,
+                    "nama_customer": nama_customer,
+                    "items_count": len(clean_items),
+                    "actor": actor_owner_id,
+                    "approval_hash": approval_hash,
+                },
+            )
+        conn.commit()
+        conn.close()
+
+        saved_out = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in saved.items()}
+        return {
+            "success": True,
+            "approved_order": saved_out,
+            "audit_event_id": event_id,
+        }
+    except (Exception, SystemExit) as exc:  # noqa: BLE001
+        return {"success": False, "status_code": 500, "error": str(exc)}
+
+
+def list_approved_orders(owner_key: str, limit: int = 50) -> dict[str, Any]:
+    """Fetch history of approved/rejected orders from `public.sekre_approved_orders`."""
+    from psycopg2.extras import RealDictCursor
+
+    try:
+        conn = profiler.get_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT * FROM public.sekre_approved_orders
+                   WHERE owner_key = %s
+                   ORDER BY approved_at DESC
+                   LIMIT %s""",
+                (owner_key, limit),
+            )
+            rows = cur.fetchall()
+        conn.close()
+        items = [
+            {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in dict(r).items()}
+            for r in rows
+        ]
+        return {"success": True, "owner_key": owner_key, "count": len(items), "items": items}
     except (Exception, SystemExit) as exc:  # noqa: BLE001
         return {"success": False, "error": str(exc), "count": 0, "items": []}

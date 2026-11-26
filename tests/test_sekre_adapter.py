@@ -277,6 +277,46 @@ class TestSekreAdapterAPIAuth:
             assert data["count"] == 1
             assert data["items"][0]["so_id"] == "SO-1001"
 
+    def test_v1_approve_order_followup_auth_and_happy_path(self):
+        # Requires JWT
+        assert client.post("/api/v1/order-followups/approve", json={"order_draft_id": "ord-1"}).status_code == 401
+
+        # Requires permission
+        ro_token = create_access_token("owner_ro", "Viewer", permissions=["ingest"])
+        assert (
+            client.post(
+                "/api/v1/order-followups/approve",
+                headers={"Authorization": f"Bearer {ro_token}"},
+                json={"order_draft_id": "ord-1", "decision": "approve", "items": [{"item": "PC200", "qty": 1, "unit": "unit"}]},
+            ).status_code
+            == 403
+        )
+
+        # Happy path
+        token = create_access_token("owner_rifat", "Rifat")
+        with patch.object(
+            sekre_adapter,
+            "approve_order_followup",
+            return_value={
+                "success": True,
+                "approved_order": {"approved_order_id": "ord_apr_123", "decision": "approved", "so_status": "processing"},
+                "audit_event_id": "evt_123",
+            },
+        ):
+            res = client.post(
+                "/api/v1/order-followups/approve",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "order_draft_id": "ord-001",
+                    "so_id": "SO-1001",
+                    "nama_customer": "PT Borneo Karya Tambang",
+                    "decision": "approve",
+                    "items": [{"item": "PC200-8M0", "qty": 4, "unit": "unit"}],
+                },
+            )
+            assert res.status_code == 200
+            assert res.json()["approved_order"]["approved_order_id"] == "ord_apr_123"
+
     def test_v1_outbox_cancel_endpoints(self):
         token = create_access_token("owner_rifat", "Rifat")
         with patch.object(
